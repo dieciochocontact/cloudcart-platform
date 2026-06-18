@@ -109,16 +109,51 @@ locals {
   user_data = <<-EOF
     #!/bin/bash
     yum update -y
-    yum install -y python3
+    yum install -y python3 python3-pip postgresql
+    pip3 install boto3 psycopg2-binary
 
-    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-    AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+    cat > /tmp/server.py << 'PYEOF'
+    import http.server
+    import json
+    import socketserver
+    import boto3
+    import psycopg2
+    import urllib.request
 
-    cat > /tmp/server.py << PYEOF
-    import http.server, json, socketserver
+    def get_instance_metadata(path):
+        try:
+            with urllib.request.urlopen(f'http://169.254.169.254/latest/meta-data/{path}', timeout=2) as r:
+                return r.read().decode()
+        except:
+            return 'unknown'
 
-    INSTANCE_ID = "$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
-    AZ = "$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)"
+    INSTANCE_ID = get_instance_metadata('instance-id')
+    AZ = get_instance_metadata('placement/availability-zone')
+
+    def get_db_credentials():
+        client = boto3.client('secretsmanager', region_name='us-east-1')
+        secret = client.get_secret_value(SecretId='vaultpay-dev/db-credentials')
+        return json.loads(secret['SecretString'])
+
+    def get_db_stats():
+        try:
+            creds = get_db_credentials()
+            conn = psycopg2.connect(
+                host=creds['host'],
+                database=creds['database'],
+                user=creds['username'],
+                password=creds['password'],
+                port=creds['port'],
+                connect_timeout=3
+            )
+            cur = conn.cursor()
+            cur.execute("SELECT version();")
+            version = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            return {'status': 'connected', 'version': version}
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -129,12 +164,78 @@ locals {
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'status': 'healthy', 'instance': INSTANCE_ID, 'az': AZ}).encode())
-            else:
+            elif self.path == '/api/db':
                 self.send_response(200)
-                self.send_header('Content-Type', 'text/html')
+                self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                html = '<html><body><h1>VaultPay Platform</h1><p>Instance: ' + INSTANCE_ID + '</p><p>AZ: ' + AZ + '</p></body></html>'
-                self.wfile.write(html.encode())
+                self.wfile.write(json.dumps(get_db_stats()).encode())
+            else:
+                db = get_db_stats()
+                db_status = 'Connected to RDS PostgreSQL' if db['status'] == 'connected' else 'Error: ' + db.get('message', 'Unknown')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                html = f'''<!DOCTYPE html>
+    <html>
+    <head>
+        <title>VaultPay Platform</title>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: Arial; background: #1a1a2e; color: white; text-align: center; padding: 50px; margin: 0; }}
+            .card {{ background: #16213e; padding: 30px; border-radius: 15px; margin: 20px auto; max-width: 600px; }}
+            .green {{ color: #00ff88; }}
+            .blue {{ color: #00b4d8; }}
+            h1 {{ color: #e94560; font-size: 2em; }}
+            .btn {{ background: #e94560; color: white; border: none; padding: 12px 25px; border-radius: 8px; cursor: pointer; font-size: 1em; margin: 8px; }}
+            .btn:hover {{ background: #c73652; }}
+            .btn-blue {{ background: #00b4d8; }}
+            .btn-blue:hover {{ background: #0090ad; }}
+            #result {{ background: #0f3460; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: left; display: none; font-family: monospace; }}
+        </style>
+    </head>
+    <body>
+        <h1>VaultPay Platform</h1>
+        <p style="color:#888">Production-Ready Fintech Infrastructure on AWS</p>
+        <div class="card">
+            <h2>Tier 2 - Application Server</h2>
+            <p class="blue">Instance: {INSTANCE_ID}</p>
+            <p class="blue">Availability Zone: {AZ}</p>
+            <button class="btn" onclick="checkHealth()">Health Check</button>
+            <button class="btn btn-blue" onclick="checkDB()">Database Status</button>
+            <div id="result"></div>
+        </div>
+        <div class="card">
+            <h2>Tier 3 - Database Connection</h2>
+            <p class="green">{db_status}</p>
+            <p style="color:#888; font-size:0.9em">RDS PostgreSQL via AWS Secrets Manager</p>
+        </div>
+        <div class="card">
+            <h2>Architecture</h2>
+            <p style="color:#888">Internet -> ALB -> EC2 (x3) -> RDS PostgreSQL</p>
+            <p style="color:#888">Multi-AZ | Terraform IaC | GitHub Actions CI/CD</p>
+        </div>
+        <script>
+            function checkHealth() {{
+                fetch('/health')
+                    .then(r => r.json())
+                    .then(d => {{
+                        document.getElementById('result').style.display = 'block';
+                        document.getElementById('result').innerHTML = '<p class="green">Health Check:</p><pre>' + JSON.stringify(d, null, 2) + '</pre>';
+                    }});
+            }}
+            function checkDB() {{
+                document.getElementById('result').style.display = 'block';
+                document.getElementById('result').innerHTML = '<p class="blue">Checking database...</p>';
+                fetch('/api/db')
+                    .then(r => r.json())
+                    .then(d => {{
+                        document.getElementById('result').innerHTML = '<p class="green">Database Status:</p><pre>' + JSON.stringify(d, null, 2) + '</pre>';
+                    }});
+            }}
+        </script>
+    </body>
+    </html>'''
+                self.wfile.write(html.encode('utf-8'))
 
     with socketserver.TCPServer(('', 80), Handler) as httpd:
         httpd.serve_forever()
@@ -142,28 +243,6 @@ locals {
 
     nohup python3 /tmp/server.py > /tmp/server.log 2>&1 &
   EOF
-}
-
-resource "aws_instance" "app" {
-  count                  = var.instance_count
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = var.instance_type
-  subnet_id              = var.private_app_subnet_ids[count.index % length(var.private_app_subnet_ids)]
-  vpc_security_group_ids = [aws_security_group.app.id]
-  key_name               = var.key_name
-  user_data              = local.user_data
-  iam_instance_profile   = aws_iam_instance_profile.app.name
-
-  tags = {
-    Name = "${var.project_name}-app-${count.index + 1}"
-  }
-}
-
-resource "aws_lb_target_group_attachment" "app" {
-  count            = var.instance_count
-  target_group_arn = aws_lb_target_group.app.arn
-  target_id        = aws_instance.app[count.index].id
-  port             = 80
 }
 
 resource "aws_iam_role" "app" {
@@ -195,7 +274,43 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+resource "aws_iam_role_policy" "secrets_access" {
+  name = "secrets-manager-access"
+  role = aws_iam_role.app.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+      Resource = "arn:aws:secretsmanager:us-east-1:101551113442:secret:vaultpay-dev/db-credentials*"
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "app" {
   name = "${var.project_name}-app-profile"
   role = aws_iam_role.app.name
+}
+
+resource "aws_instance" "app" {
+  count                  = var.instance_count
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = var.instance_type
+  subnet_id              = var.private_app_subnet_ids[count.index % length(var.private_app_subnet_ids)]
+  vpc_security_group_ids = [aws_security_group.app.id]
+  key_name               = var.key_name
+  iam_instance_profile   = aws_iam_instance_profile.app.name
+  user_data              = local.user_data
+
+  tags = {
+    Name = "${var.project_name}-app-${count.index + 1}"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "app" {
+  count            = var.instance_count
+  target_group_arn = aws_lb_target_group.app.arn
+  target_id        = aws_instance.app[count.index].id
+  port             = 80
 }
