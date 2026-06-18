@@ -119,6 +119,7 @@ locals {
     import boto3
     import psycopg2
     import urllib.request
+    from datetime import datetime, timedelta
 
     def get_instance_metadata(path):
         try:
@@ -129,9 +130,10 @@ locals {
 
     INSTANCE_ID = get_instance_metadata('instance-id')
     AZ = get_instance_metadata('placement/availability-zone')
+    REGION = 'us-east-1'
 
     def get_db_credentials():
-        client = boto3.client('secretsmanager', region_name='us-east-1')
+        client = boto3.client('secretsmanager', region_name=REGION)
         secret = client.get_secret_value(SecretId='vaultpay-dev/db-credentials')
         return json.loads(secret['SecretString'])
 
@@ -155,6 +157,30 @@ locals {
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
 
+    def get_metrics():
+        try:
+            cw = boto3.client('cloudwatch', region_name=REGION)
+            end = datetime.utcnow()
+            start = end - timedelta(minutes=10)
+
+            cpu = cw.get_metric_statistics(
+                Namespace='AWS/EC2',
+                MetricName='CPUUtilization',
+                Dimensions=[{'Name': 'InstanceId', 'Value': INSTANCE_ID}],
+                StartTime=start,
+                EndTime=end,
+                Period=300,
+                Statistics=['Average']
+            )
+            cpu_val = round(cpu['Datapoints'][-1]['Average'], 2) if cpu['Datapoints'] else 0
+
+            alarms = cw.describe_alarms(AlarmNamePrefix='vaultpay-dev')
+            alarm_list = [{'name': a['AlarmName'], 'state': a['StateValue']} for a in alarms['MetricAlarms']]
+
+            return {'cpu_percent': cpu_val, 'alarms': alarm_list, 'instance': INSTANCE_ID}
+        except Exception as e:
+            return {'error': str(e)}
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             pass
@@ -169,6 +195,11 @@ locals {
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps(get_db_stats()).encode())
+            elif self.path == '/api/metrics':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(get_metrics()).encode())
             else:
                 db = get_db_stats()
                 db_status = 'Connected to RDS PostgreSQL' if db['status'] == 'connected' else 'Error: ' + db.get('message', 'Unknown')
@@ -185,35 +216,47 @@ locals {
             .card {{ background: #16213e; padding: 30px; border-radius: 15px; margin: 20px auto; max-width: 600px; }}
             .green {{ color: #00ff88; }}
             .blue {{ color: #00b4d8; }}
+            .red {{ color: #e94560; }}
             h1 {{ color: #e94560; font-size: 2em; }}
             .btn {{ background: #e94560; color: white; border: none; padding: 12px 25px; border-radius: 8px; cursor: pointer; font-size: 1em; margin: 8px; }}
             .btn:hover {{ background: #c73652; }}
             .btn-blue {{ background: #00b4d8; }}
             .btn-blue:hover {{ background: #0090ad; }}
-            #result {{ background: #0f3460; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: left; display: none; font-family: monospace; }}
+            .btn-green {{ background: #00ff88; color: #1a1a2e; }}
+            .btn-green:hover {{ background: #00cc70; }}
+            #result {{ background: #0f3460; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: left; display: none; font-family: monospace; font-size: 0.9em; }}
+            .metric {{ display: inline-block; background: #0f3460; padding: 15px 25px; border-radius: 10px; margin: 8px; }}
+            .metric-value {{ font-size: 2em; font-weight: bold; color: #00ff88; }}
+            .metric-label {{ font-size: 0.8em; color: #888; }}
         </style>
     </head>
     <body>
         <h1>VaultPay Platform</h1>
         <p style="color:#888">Production-Ready Fintech Infrastructure on AWS</p>
+
         <div class="card">
             <h2>Tier 2 - Application Server</h2>
             <p class="blue">Instance: {INSTANCE_ID}</p>
             <p class="blue">Availability Zone: {AZ}</p>
             <button class="btn" onclick="checkHealth()">Health Check</button>
             <button class="btn btn-blue" onclick="checkDB()">Database Status</button>
+            <button class="btn btn-green" onclick="checkMetrics()">Live Metrics</button>
             <div id="result"></div>
         </div>
+
         <div class="card">
             <h2>Tier 3 - Database Connection</h2>
             <p class="green">{db_status}</p>
             <p style="color:#888; font-size:0.9em">RDS PostgreSQL via AWS Secrets Manager</p>
         </div>
+
         <div class="card">
             <h2>Architecture</h2>
             <p style="color:#888">Internet -> ALB -> EC2 (x3) -> RDS PostgreSQL</p>
             <p style="color:#888">Multi-AZ | Terraform IaC | GitHub Actions CI/CD</p>
+            <p style="color:#888">CloudWatch | VPC Flow Logs | CloudTrail</p>
         </div>
+
         <script>
             function checkHealth() {{
                 fetch('/health')
@@ -230,6 +273,17 @@ locals {
                     .then(r => r.json())
                     .then(d => {{
                         document.getElementById('result').innerHTML = '<p class="green">Database Status:</p><pre>' + JSON.stringify(d, null, 2) + '</pre>';
+                    }});
+            }}
+            function checkMetrics() {{
+                document.getElementById('result').style.display = 'block';
+                document.getElementById('result').innerHTML = '<p class="blue">Loading metrics from CloudWatch...</p>';
+                fetch('/api/metrics')
+                    .then(r => r.json())
+                    .then(d => {{
+                        let html = '<p class="green">Live Metrics:</p>';
+                        html += '<pre>' + JSON.stringify(d, null, 2) + '</pre>';
+                        document.getElementById('result').innerHTML = html;
                     }});
             }}
         </script>
@@ -284,6 +338,20 @@ resource "aws_iam_role_policy" "secrets_access" {
       Effect   = "Allow"
       Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
       Resource = "arn:aws:secretsmanager:us-east-1:101551113442:secret:vaultpay-dev/db-credentials*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "cloudwatch_read" {
+  name = "cloudwatch-read-access"
+  role = aws_iam_role.app.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["cloudwatch:GetMetricStatistics", "cloudwatch:DescribeAlarms", "cloudwatch:ListMetrics"]
+      Resource = "*"
     }]
   })
 }
