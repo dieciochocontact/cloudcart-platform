@@ -225,9 +225,6 @@ locals {
             .btn-green {{ background: #00ff88; color: #1a1a2e; }}
             .btn-green:hover {{ background: #00cc70; }}
             #result {{ background: #0f3460; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: left; display: none; font-family: monospace; font-size: 0.9em; }}
-            .metric {{ display: inline-block; background: #0f3460; padding: 15px 25px; border-radius: 10px; margin: 8px; }}
-            .metric-value {{ font-size: 2em; font-weight: bold; color: #00ff88; }}
-            .metric-label {{ font-size: 0.8em; color: #888; }}
         </style>
     </head>
     <body>
@@ -252,9 +249,9 @@ locals {
 
         <div class="card">
             <h2>Architecture</h2>
-            <p style="color:#888">Internet -> ALB -> EC2 (x3) -> RDS PostgreSQL</p>
+            <p style="color:#888">Internet -> ALB -> Auto Scaling Group -> RDS PostgreSQL</p>
             <p style="color:#888">Multi-AZ | Terraform IaC | GitHub Actions CI/CD</p>
-            <p style="color:#888">CloudWatch | VPC Flow Logs | CloudTrail</p>
+            <p style="color:#888">CloudWatch | VPC Flow Logs | CloudTrail | Auto Scaling</p>
         </div>
 
         <script>
@@ -361,24 +358,93 @@ resource "aws_iam_instance_profile" "app" {
   role = aws_iam_role.app.name
 }
 
-resource "aws_instance" "app" {
-  count                  = var.instance_count
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = var.instance_type
-  subnet_id              = var.private_app_subnet_ids[count.index % length(var.private_app_subnet_ids)]
-  vpc_security_group_ids = [aws_security_group.app.id]
-  key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.app.name
-  user_data              = local.user_data
+resource "aws_launch_template" "app" {
+  name_prefix   = "${var.project_name}-app-"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = var.instance_type
+  key_name      = var.key_name
+  user_data     = base64encode(local.user_data)
 
-  tags = {
-    Name = "${var.project_name}-app-${count.index + 1}"
+  iam_instance_profile {
+    name = aws_iam_instance_profile.app.name
+  }
+
+  vpc_security_group_ids = [aws_security_group.app.id]
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.project_name}-app-asg"
+    }
   }
 }
 
-resource "aws_lb_target_group_attachment" "app" {
-  count            = var.instance_count
-  target_group_arn = aws_lb_target_group.app.arn
-  target_id        = aws_instance.app[count.index].id
-  port             = 80
+resource "aws_autoscaling_group" "app" {
+  name                = "${var.project_name}-asg"
+  vpc_zone_identifier = var.private_app_subnet_ids
+  target_group_arns   = [aws_lb_target_group.app.arn]
+  min_size            = 3
+  max_size            = 6
+  desired_capacity    = 3
+  health_check_type   = "ELB"
+  health_check_grace_period = 120
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${var.project_name}-app-asg"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${var.project_name}-scale-up"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown                = 120
+  autoscaling_group_name = aws_autoscaling_group.app.name
+}
+
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${var.project_name}-scale-down"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown                = 120
+  autoscaling_group_name = aws_autoscaling_group.app.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "scale_up_alarm" {
+  alarm_name          = "${var.project_name}-asg-scale-up"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 70
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
+  alarm_name          = "${var.project_name}-asg-scale-down"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 20
+  alarm_actions       = [aws_autoscaling_policy.scale_down.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app.name
+  }
 }

@@ -38,6 +38,5 @@ module "monitoring" {
   project_name            = "vaultpay-dev"
   alb_arn_suffix          = module.compute.alb_arn_suffix
   target_group_arn_suffix = module.compute.target_group_arn_suffix
-  instance_ids            = module.compute.instance_ids
   alert_email             = "dieciochocontact@gmail.com"
 }

@@ -8,24 +8,6 @@ resource "aws_sns_topic_subscription" "email" {
   endpoint  = var.alert_email
 }
 
-resource "aws_cloudwatch_metric_alarm" "cpu_high" {
-  count               = length(var.instance_ids)
-  alarm_name          = "${var.project_name}-cpu-high-${count.index + 1}"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 120
-  statistic           = "Average"
-  threshold           = 80
-  alarm_description   = "CPU por encima del 80% durante 4 minutos"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-
-  dimensions = {
-    InstanceId = var.instance_ids[count.index]
-  }
-}
-
 resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
   alarm_name          = "${var.project_name}-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"
@@ -67,17 +49,6 @@ resource "aws_cloudwatch_dashboard" "main" {
 
   dashboard_body = jsonencode({
     widgets = [
-      {
-        type = "metric"
-        properties = {
-          title  = "CPU Utilization - App Servers"
-          region = "us-east-1"
-          period = 60
-          metrics = [
-            for id in var.instance_ids : ["AWS/EC2", "CPUUtilization", "InstanceId", id]
-          ]
-        }
-      },
       {
         type = "metric"
         properties = {

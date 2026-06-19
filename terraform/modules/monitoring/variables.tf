@@ -13,11 +13,6 @@ variable "target_group_arn_suffix" {
   type        = string
 }
 
-variable "instance_ids" {
-  description = "IDs de las instancias EC2"
-  type        = list(string)
-}
-
 variable "alert_email" {
   description = "Email para recibir las alarmas"
   type        = string
